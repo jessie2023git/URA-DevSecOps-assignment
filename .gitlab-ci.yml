@@ -1,0 +1,246 @@
+# Assume that VPC is alreacy created as you are network is controled by landing zone
+# Assume that the ECR is already created
+stages:
+  - build
+  - deploy
+  - update-apigw
+  - container-cleanup
+  - apigw-cleanup
+
+# Default environment variables for deployment
+variables:
+  DEPLOYMENT_DIR: "/path/to/deployments"
+  MAIN_BRANCH: "main"
+  AWS_REGION: "ap-southeast-1"  
+  ECR_REPOSITORY: "ura-repo"
+  ECR_REGISTRY: "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+  DOCKER_IMAGE_TAG: "${ECR_REGISTRY}/${ECR_REPOSITORY}:${CI_COMMIT_REF_NAME}" 
+# Cache to speed up subsequent builds
+cache:
+  paths:
+    - node_modules/
+    - .npm/
+
+before_script:
+  - echo "Logging into AWS ECR for the $CI_ENVIRONMENT_NAME environment..."
+
+  # Set AWS credentials based on the environment
+  - |
+    if [[ "$CI_COMMIT_REF_NAME" == "main" ]]; then
+      export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID_MAIN
+      export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_MAIN
+      export AWS_REGION=$AWS_REGION
+      export AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID_MAIN
+      echo "Using AWS credentials for main branch"
+    elif [[ "$CI_COMMIT_REF_NAME" == feature-* ]]; then
+      # Feature branch AWS credentials
+      export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID_FEATURE
+      export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY_FEATURE
+      export AWS_REGION=$AWS_REGION
+      export AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID_FEATURE
+      echo "Using AWS credentials for feature branch: $CI_COMMIT_REF_NAME"
+    fi
+  - echo "Using AWS region $AWS_REGION"
+  
+# Job to build the application using Docker and push to AWS ECR
+build_job:
+  stage: build
+  script:
+    - echo "Logging into AWS ECR..."
+    - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY  
+    - echo "Building Docker image for branch ${CI_COMMIT_REF_NAME}..."
+    - docker build -t $DOCKER_IMAGE_TAG .  
+    - echo "Pushing Docker image to AWS ECR..."
+    - docker push $DOCKER_IMAGE_TAG  
+  only: # Runs for main branch and feature branche
+    - main
+    - /^feature-.*$/  
+
+# Job to deploy feature branches to their respective environments
+deploy_feature:
+  stage: deploy
+  script:
+    - echo "Deploying the feature branch Infra"
+    - cd terraform/infrastructure
+    - terraform init -reconfigure -backend-config="backend/dev.conf"
+    - terraform validate -input=false
+    - terraform plan --var-file="dev.tfvars" -var="env=$CI_COMMIT_REF_NAME" -lock=false
+    - terraform apply --var-file="dev.tfvars" -var="env=$CI_COMMIT_REF_NAME" --auto-approve 
+    - echo "Deploying the feature branch Application"
+    - cd terraform/application
+    - terraform init -reconfigure -backend-config="backend/dev.conf"
+    - terraform validate -input=false
+    - terraform plan --var-file="dev.tfvars" -var="env=$CI_COMMIT_REF_NAME" -lock=false
+    - terraform apply --var-file="dev.tfvars" -var="env=$CI_COMMIT_REF_NAME" --auto-approve
+  only:
+    - /^feature-.*/  # Runs for all feature branches (e.g., feature-{featureName})
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    url: https://your-feature-deployment-url.com/$CI_COMMIT_REF_NAME
+    on_stop: stop_review
+
+#Stop job to clean up feature branch deployments
+stop_review:
+  stage: container-cleanup
+  script:
+    - echo "Destroying the feature branch Infra"
+    - cd terraform/infrastructure
+    - terraform init -reconfigure -backend-config="backend/dev.conf"
+    - terraform validate -input=false
+    - terraform plan --var-file="dev.tfvars" -var="env=$CI_COMMIT_REF_NAME" -lock=false
+    - terraform destroy --var-file="dev.tfvars" -var="env=$CI_COMMIT_REF_NAME" --auto-approve 
+    - echo "Destroying the feature branch Application"
+    - cd terraform/application
+    - terraform init -reconfigure -backend-config="backend/dev.conf"
+    - terraform validate -input=false
+    - terraform plan --var-file="dev.tfvars" -var="env=$CI_COMMIT_REF_NAME" -lock=false
+    - terraform destroy --var-file="dev.tfvars" -var="env=$CI_COMMIT_REF_NAME" --auto-approve
+  when: manual
+  only:
+    - /^feature-.*/ 
+
+update_apigw_feature:
+  stage: update-apigw
+  script:
+    - echo "Updating API Gateway root resource to point to ECS container"
+    - ALB_URL=$(aws elbv2 describe-load-balancers --names "DL-application-$CI_COMMIT_REF_NAME-ALB" --query 'LoadBalancers[0].DNSName' --output text)
+    - API_GW_ID=$(aws apigateway get-rest-apis --query "items[?name=='sample-app-apigw'].id" --output text)
+    - BRANCH_NAME_CLEAN=${CI_COMMIT_REF_NAME#feature-} # Remove 'feature-' prefix
+    - TARGET_PATH="/feature/${BRANCH_NAME_CLEAN}"
+    - TARGET_STAGE="feature-${BRANCH_NAME_CLEAN}"
+    - ROOT_RESOURCE_ID=$(aws apigateway get-resources --rest-api-id $API_GW_ID --query "items[?path=='/'].id" --output text)
+    - TARGET_RESOURCE_ID=$(aws apigateway get-resources --rest-api-id $API_GW_ID --query "items[?path=='$TARGET_PATH'].id" --output text)
+
+    - |
+      if [[ -z "$TARGET_RESOURCE_ID" ]]; then
+        echo "Target path $TARGET_PATH does not exist. Creating resource..."
+        TARGET_RESOURCE_ID=$(aws apigateway create-resource \
+          --rest-api-id $API_GW_ID \
+          --parent-id $ROOT_RESOURCE_ID \
+          --path-part "$(basename $TARGET_PATH)" \
+          --query 'id' \
+          --output text)
+      else
+        echo "Target resource $TARGET_PATH already exists. ID: $TARGET_RESOURCE_ID"
+      fi
+
+    # Put method
+    - aws apigateway put-method \
+        --rest-api-id $API_GW_ID \
+        --resource-id $TARGET_RESOURCE_ID \
+        --http-method ANY \
+        --authorization-type NONE
+
+    # Put integration
+    - aws apigateway put-integration \
+        --rest-api-id $API_GW_ID \
+        --resource-id $TARGET_RESOURCE_ID \
+        --http-method ANY \
+        --type HTTP_PROXY \
+        --integration-http-method ANY \
+        --uri "http://$ALB_URL" \
+        --passthrough-behavior WHEN_NO_MATCH
+
+    # Deploy
+    - aws apigateway create-deployment \
+        --rest-api-id $API_GW_ID \
+        --stage-name $TARGET_STAGE  # dynamic stage depending on branch
+  only:
+    - /^feature-.*$/
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    on_stop: stop_review_2
+
+stop_review_2:
+  stage: apigw-cleanup
+  script:
+    - echo "Stopping review app and deleting feature path in API Gateway"
+    - BRANCH_NAME_CLEAN=$(echo "$CI_COMMIT_REF_NAME" | sed 's/^feature-//')
+    - TARGET_PATH="/feature/$BRANCH_NAME_CLEAN"
+    - API_GW_ID=$(aws apigateway get-rest-apis --query "items[?name=='sample-app-apigw'].id" --output text)
+    - ROOT_RESOURCE_ID=$(aws apigateway get-resources --rest-api-id $API_GW_ID --query "items[?path=='/'].id" --output text)
+    - RESOURCE_ID=$(aws apigateway get-resources --rest-api-id $API_GW_ID --query "items[?path=='$TARGET_PATH'].id" --output text)
+
+    - if [ -n "$RESOURCE_ID" ]; then
+        echo "Deleting resource at $TARGET_PATH with ID $RESOURCE_ID";
+        aws apigateway delete-resource --rest-api-id $API_GW_ID --resource-id $RESOURCE_ID;
+      else
+        echo "No resource found for $TARGET_PATH";
+      fi
+  when: manual
+  only:
+    - /^feature-.*/ 
+
+# Main deployment stage with logic to check for first run using GitLab variable
+deploy_infra:
+  stage: deploy
+  script:
+    # Check if the FIRST_RUN_DEPLOY variable is set to "true" (meaning it's the first run)
+    - |
+      if [[ "$CI_COMMIT_REF_NAME" == "main" && "$FIRST_RUN_DEPLOY" == "true" ]]; then
+        echo "First run detected on the main branch, deploying infrastructure..."
+
+        # Your infrastructure deployment commands go here
+        # For example, deploy with Terraform
+        cd terraform/infrastructure
+        terraform init -reconfigure -backend-config="backend/prod.conf"
+        terraform validate -input=false
+        terraform plan --var-file prod.tfvars -lock=false
+        terraform apply --var-file prod.tfvars --auto-approve
+        # Update the FIRST_RUN_DEPLOY variable to "false" after successful deployment
+        # This will prevent the infrastructure deployment in the future
+        curl --request PUT --form "value=false" "https://gitlab.com/tigerting98/ura-sample-project/:id/variables/FIRST_RUN_DEPLOY" 
+      else
+        echo "Skipping infrastructure deployment, as this is not the first run or not the master branch."
+      fi
+  only:
+    - main 
+
+# Job to deploy the `main` branch to its respective environment
+deploy_main:
+  stage: deploy
+  script:
+    - echo "Deploying the main branch..."
+    - cd terraform/application
+    - terraform init -reconfigure -backend-config="backend/prod.conf"
+    - terraform validate -input=false
+    - terraform plan --var-file prod.tfvars -lock=false
+    - terraform apply --var-file prod.tfvars --auto-approve
+    - export FEATURE_NAME=${CI_COMMIT_REF_NAME#"feature-"}
+    - export ALB_TARGET_GROUP_NAME=${ALB_TARGET_GROUP_PREFIX}${FEATURE_NAME}    
+  only:
+    - main
+  environment:
+    name: production
+    url: https://your-production-url.com
+    
+# Update API Gateway to route traffic to the ECS container
+update_apigw_main:
+  stage: update-apigw
+  script:
+    - echo "Updating API Gateway root resource to point to ECS container"
+    - ALB_URL=$(aws elbv2 describe-load-balancers --names "DL-application-$CI_COMMIT_REF_NAME-ALB" --query 'LoadBalancers[0].DNSName' --output text)
+    - API_GW_ID=$(aws apigateway get-rest-apis --query "items[?name=='sample-app-apigw'].id" --output text)
+    - ROOT_RESOURCE_ID=$(aws apigateway get-resources --rest-api-id $API_GW_ID --query "items[?path=='/'].id" --output text)
+    
+    - aws apigateway put-method \
+        --rest-api-id $API_GW_ID \
+        --resource-id $ROOT_RESOURCE_ID \
+        --http-method ANY \
+        --authorization-type NONE
+
+    - aws apigateway put-integration \
+        --rest-api-id $API_GW_ID \
+        --resource-id $ROOT_RESOURCE_ID \
+        --http-method ANY \
+        --type HTTP_PROXY \
+        --integration-http-method ANY \
+        --uri "http://$ALB_URL" \
+        --passthrough-behavior WHEN_NO_MATCH
+
+    - aws apigateway create-deployment \
+        --rest-api-id $API_GW_ID \
+        --stage-name production  # Deploy to production stage
+  only:
+    - main
+

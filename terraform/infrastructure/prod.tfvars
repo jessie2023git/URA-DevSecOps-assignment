@@ -1,0 +1,5 @@
+vpc_id = "vpc-0a7f829e7c83b81f7"
+proj = "application"
+env = "prod"
+certificate_arn = "arn:aws:acm:ap-southeast-1:account:certificate/6c4146d1-666e-4d3a-b40a-ee75a5e5f5c8"
+prefix_list_ids = "pl-6fa54006"
